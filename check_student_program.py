@@ -64,9 +64,12 @@ def check_homepage_for_student_link():
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            text = a.get_text(strip=True).lower()
-            if "student" in href.lower() or "student" in text:
+            href_lower = a["href"].lower()
+            # Only match links that belong to the wc2026 conference itself —
+            # NOT the site-wide global nav, which has unrelated "student"
+            # links (e.g. /membership/students/, /nuclear/highschoolstudents/).
+            if "wc2026" in href_lower and "student" in href_lower:
+                href = a["href"]
                 if href.startswith("/"):
                     href = "https://www.ans.org" + href
                 return href
