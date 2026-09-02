@@ -1,28 +1,36 @@
 """
-Checks whether the ANS 2026 Winter Conference & Expo Student Program page
-has gone live, and emails an alert the first time it's detected.
+Watches the (now-live) ANS 2026 Winter Conference Student Program page
+for a CONTENT change -- specifically, a change to the page's own
+"Last modified" timestamp, which the site prints whenever this page's
+body is edited. Right now the page says "Registration for the Student
+Program will open soon!"; the next time an editor updates that page
+(most likely to open registration), this timestamp will move, and this
+script will email an alert.
 
-Detection strategy (two independent checks, either one triggers an alert):
-  1. Direct hit: GET the guessed URL (wc2026/student/) and see if it 200s.
-  2. Nav-link scan: GET the conference homepage and look for any link whose
-     href or text contains "student" — this catches ANS linking the page
-     from a slightly different slug than we guessed.
+Why watch "Last modified" instead of diffing the whole page: this page
+shares a global header, nav, and footer with every ANS page, and those
+contain rotating pieces (a "Latest News" snippet, magazine cover art,
+etc.) that change ON THEIR OWN and would trigger constant false
+positives if the entire page HTML were hashed. The per-page "Last
+modified" line only moves when THIS page's own content is edited, so
+it's a clean, low-noise signal.
 
-State is persisted in state.json (committed back to the repo by the GitHub
-Actions workflow) so we only send one email, not one every 15 minutes.
+First run after this script is installed: no baseline exists yet, so it
+just records the current "Last modified" value and exits WITHOUT
+emailing (this is the seeding run -- trigger it manually once after
+deploying). Every run after that compares against the saved baseline
+and emails the moment it changes.
 """
 
 import os
+import re
 import json
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
 
 STATE_FILE = "state.json"
-
-CANDIDATE_URL = "https://www.ans.org/meetings/wc2026/student/"
-CONFERENCE_HOME = "https://www.ans.org/meetings/wc2026/"
+URL = "https://www.ans.org/meetings/wc2026/student/"
 
 HEADERS = {
     "User-Agent": (
@@ -33,12 +41,14 @@ HEADERS = {
 
 RECIPIENT_EMAIL = "rhirji3@gatech.edu"
 
+LAST_MODIFIED_RE = re.compile(r"Last modified[^<\n]{0,60}", re.IGNORECASE)
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"notified": False, "found_url": None}
+    return {"content_baseline_last_modified": None, "content_change_notified": False}
 
 
 def save_state(state):
@@ -46,52 +56,30 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def check_direct_url():
-    try:
-        resp = requests.get(CANDIDATE_URL, headers=HEADERS, timeout=20, allow_redirects=True)
-        if resp.status_code == 200:
-            return resp.url
-    except requests.RequestException as e:
-        print(f"Direct URL check failed: {e}")
-    return None
+def get_last_modified_string():
+    resp = requests.get(URL, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    match = LAST_MODIFIED_RE.search(resp.text)
+    if not match:
+        return None
+    return match.group(0).strip()
 
 
-def check_homepage_for_student_link():
-    try:
-        resp = requests.get(CONFERENCE_HOME, headers=HEADERS, timeout=20)
-        if resp.status_code != 200:
-            print(f"Homepage returned status {resp.status_code}")
-            return None
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href_lower = a["href"].lower()
-            # Only match links that belong to the wc2026 conference itself —
-            # NOT the site-wide global nav, which has unrelated "student"
-            # links (e.g. /membership/students/, /nuclear/highschoolstudents/).
-            if "wc2026" in href_lower and "student" in href_lower:
-                href = a["href"]
-                if href.startswith("/"):
-                    href = "https://www.ans.org" + href
-                return href
-    except requests.RequestException as e:
-        print(f"Homepage check failed: {e}")
-    return None
-
-
-def send_email(found_url):
+def send_email(old_value, new_value):
     import smtplib
     from email.mime.text import MIMEText
 
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
 
-    subject = "🚨 ANS 2026 Winter Conference Student Program is LIVE"
+    subject = "ANS Student Program page content changed"
     body = (
-        f"The student program page appears to be live as of "
+        f"The student program page's content changed as of "
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.\n\n"
-        f"URL: {found_url}\n\n"
-        f"Go sign up now — no formal announcement is made, so this may not "
-        f"stay quiet for long."
+        f"Previous: {old_value}\n"
+        f"Now:      {new_value}\n\n"
+        f"URL: {URL}\n\n"
+        f"This likely means registration has opened -- go check it."
     )
 
     msg = MIMEText(body)
@@ -107,23 +95,33 @@ def send_email(found_url):
 def main():
     state = load_state()
 
-    if state.get("notified"):
-        print("Already notified previously — nothing to do. "
-              "(Reset state.json's 'notified' field to false to re-arm.)")
+    if state.get("content_change_notified"):
+        print("Already notified about a content change -- nothing to do.")
         return
 
-    found_url = check_direct_url() or check_homepage_for_student_link()
+    current = get_last_modified_string()
+    if current is None:
+        print("Could not find a 'Last modified' string on the page this run -- "
+              "site markup may have changed. Skipping (will retry next run).")
+        return
 
-    if found_url:
-        print(f"Student program page detected: {found_url}")
-        send_email(found_url)
-        state["notified"] = True
-        state["found_url"] = found_url
+    baseline = state.get("content_baseline_last_modified")
+
+    if baseline is None:
+        state["content_baseline_last_modified"] = current
+        save_state(state)
+        print(f"Baseline captured: '{current}'. Will alert on the next change.")
+        return
+
+    if current != baseline:
+        print(f"Change detected: '{baseline}' -> '{current}'")
+        send_email(baseline, current)
+        state["content_change_notified"] = True
+        state["content_baseline_last_modified"] = current
         save_state(state)
         print("Email sent and state updated.")
     else:
-        print(f"Not live yet, checked at "
-              f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"No change yet (still: '{current}')")
 
 
 if __name__ == "__main__":
